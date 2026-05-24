@@ -516,3 +516,223 @@ def repeat_fixed_splitting(
     summary["mean_total_events"] = df["total_events"].mean()
 
     return summary, df
+
+
+def simulate_two_queues_esscher(
+    q_ask0,
+    q_bid0,
+    rates_original,
+    rates_tilted,
+    rng,
+    max_events=10_000_000,
+):
+    """
+    Simulate the two independent birth-death queues under the tilted law Q.
+
+    The likelihood ratio L_tau = dP/dQ is computed up to
+    tau = tau_ask wedge tau_bid.
+
+    Parameters
+    ----------
+    q_ask0, q_bid0 : int
+        Initial sizes of the ask and bid queues.
+
+    rates_original : dict
+        Original intensities under P.
+
+    rates_tilted : dict
+        Tilted intensities under Q.
+
+    rng : np.random.Generator
+        Random number generator.
+
+    max_events : int
+        Safety cap on the number of simulated events.
+
+    Returns
+    -------
+    dict
+        One simulated trajectory summary:
+        - rare_event: bool, whether tau_ask < tau_bid
+        - tau: stopping time
+        - log_likelihood: log(dP/dQ)
+        - likelihood: dP/dQ
+        - weighted_indicator: 1_rare_event * likelihood
+        - event counts under the simulated trajectory
+    """
+
+    q_ask = int(q_ask0)
+    q_bid = int(q_bid0)
+    t = 0.0
+
+    # Event counts up to tau
+    n_ask_plus = 0
+    n_ask_minus = 0
+    n_bid_plus = 0
+    n_bid_minus = 0
+
+    tilted_values = np.array(
+        [
+            rates_tilted["lambda_ask_plus"],
+            rates_tilted["lambda_ask_minus"],
+            rates_tilted["lambda_bid_plus"],
+            rates_tilted["lambda_bid_minus"],
+        ],
+        dtype=float,
+    )
+
+    if np.any(tilted_values <= 0):
+        raise ValueError("All tilted intensities must be strictly positive.")
+
+    original_values = np.array(
+        [
+            rates_original["lambda_ask_plus"],
+            rates_original["lambda_ask_minus"],
+            rates_original["lambda_bid_plus"],
+            rates_original["lambda_bid_minus"],
+        ],
+        dtype=float,
+    )
+
+    if np.any(original_values <= 0):
+        raise ValueError("All original intensities must be strictly positive.")
+
+    total_rate_tilted = tilted_values.sum()
+    event_probabilities = tilted_values / total_rate_tilted
+
+    for n_events in range(1, max_events + 1):
+        dt = rng.exponential(1.0 / total_rate_tilted)
+        t += dt
+
+        event = rng.choice(4, p=event_probabilities)
+
+        if event == 0:
+            q_ask += 1
+            n_ask_plus += 1
+
+        elif event == 1:
+            q_ask -= 1
+            n_ask_minus += 1
+
+        elif event == 2:
+            q_bid += 1
+            n_bid_plus += 1
+
+        else:
+            q_bid -= 1
+            n_bid_minus += 1
+
+        if q_ask <= 0 or q_bid <= 0:
+            break
+
+    else:
+        raise RuntimeError("max_events reached before one queue hit zero.")
+
+    rare_event = q_ask <= 0 and q_bid > 0
+
+    counts = np.array(
+        [n_ask_plus, n_ask_minus, n_bid_plus, n_bid_minus],
+        dtype=float,
+    )
+
+    # log L_tau = sum_i [ (tilde_lambda_i - lambda_i) tau
+    #                    + N_i(tau) log(lambda_i / tilde_lambda_i) ]
+    log_likelihood = np.sum(
+        (tilted_values - original_values) * t
+        + counts * np.log(original_values / tilted_values)
+    )
+
+    likelihood = np.exp(log_likelihood)
+    weighted_indicator = float(rare_event) * likelihood
+
+    return {
+        "rare_event": rare_event,
+        "tau": t,
+        "log_likelihood": log_likelihood,
+        "likelihood": likelihood,
+        "weighted_indicator": weighted_indicator,
+        "n_events": n_events,
+        "n_ask_plus": n_ask_plus,
+        "n_ask_minus": n_ask_minus,
+        "n_bid_plus": n_bid_plus,
+        "n_bid_minus": n_bid_minus,
+    }
+
+
+def esscher_importance_sampling(
+    n_samples,
+    q_ask0,
+    q_bid0,
+    rates_original,
+    rates_tilted,
+    seed=None,
+):
+    """
+    Estimate P(tau_ask < tau_bid) using Esscher-type change of intensity.
+
+    The simulation is done under rates_tilted, and each path is corrected
+    by the likelihood ratio dP/dQ.
+    """
+
+    rng = np.random.default_rng(seed)
+
+    weighted_indicators = np.empty(n_samples)
+    rare_events_under_q = np.empty(n_samples, dtype=bool)
+    taus = np.empty(n_samples)
+    log_likelihoods = np.empty(n_samples)
+    likelihoods = np.empty(n_samples)
+    n_events = np.empty(n_samples, dtype=int)
+
+    for k in range(n_samples):
+        out = simulate_two_queues_esscher(
+            q_ask0=q_ask0,
+            q_bid0=q_bid0,
+            rates_original=rates_original,
+            rates_tilted=rates_tilted,
+            rng=rng,
+        )
+
+        weighted_indicators[k] = out["weighted_indicator"]
+        rare_events_under_q[k] = out["rare_event"]
+        taus[k] = out["tau"]
+        log_likelihoods[k] = out["log_likelihood"]
+        likelihoods[k] = out["likelihood"]
+        n_events[k] = out["n_events"]
+
+    estimate = weighted_indicators.mean()
+    std = weighted_indicators.std(ddof=1)
+    standard_error = std / np.sqrt(n_samples)
+
+    ci95_low = estimate - 1.96 * standard_error
+    ci95_high = estimate + 1.96 * standard_error
+
+    relative_error = standard_error / estimate if estimate > 0 else np.inf
+
+    summary = {
+        "method": "Esscher / intensity change",
+        "n_samples": n_samples,
+        "estimate": estimate,
+        "standard_error": standard_error,
+        "ci95_low": ci95_low,
+        "ci95_high": ci95_high,
+        "relative_error": relative_error,
+        "rare_events_under_tilted_law": int(rare_events_under_q.sum()),
+        "rare_event_frequency_under_tilted_law": rare_events_under_q.mean(),
+        "mean_tau": taus.mean(),
+        "mean_n_events": n_events.mean(),
+        "mean_likelihood": likelihoods.mean(),
+        "min_log_likelihood": log_likelihoods.min(),
+        "max_log_likelihood": log_likelihoods.max(),
+    }
+
+    raw = {
+        "weighted_indicators": weighted_indicators,
+        "rare_events_under_q": rare_events_under_q,
+        "taus": taus,
+        "log_likelihoods": log_likelihoods,
+        "likelihoods": likelihoods,
+        "n_events": n_events,
+    }
+
+    return summary, raw
+
